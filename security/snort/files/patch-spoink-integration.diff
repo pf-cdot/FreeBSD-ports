@@ -43,7 +43,7 @@ diff -ruN ./snort-2.9.20.orig/src/output-plugins/Makefile.in ./snort-2.9.20/src/
 diff -ruN ./snort-2.9.20.orig/src/output-plugins/spo_pf.c ./snort-2.9.20/src/output-plugins/spo_pf.c
 --- ./snort-2.9.20.orig/src/output-plugins/spo_pf.c	1969-12-31 19:00:00.000000000 -0500
 +++ ./src/output-plugins/spo_pf.c	2024-02-24 19:40:08.000000000 -0500
-@@ -0,0 +1,947 @@
+@@ -0,0 +1,920 @@
 +/*
 +* Copyright (c) 2024  Bill Meeks
 +* Copyright (c) 2012  Ermal Luci
@@ -254,6 +254,9 @@ diff -ruN ./snort-2.9.20.orig/src/output-plugins/spo_pf.c ./snort-2.9.20/src/out
 +    SpoAlertPfData *data = (SpoAlertPfData *)arg;
 +    sfaddr_t *ip;
 +
++    // Test for valid IP header in packet and
++    // ignore packets with no valid IP information
++    // since we need IP addresses to block.
 +    if (!IsIP(p))
 +        return;
 +
@@ -262,16 +265,19 @@ diff -ruN ./snort-2.9.20.orig/src/output-plugins/spo_pf.c ./snort-2.9.20/src/out
 +            ip = GET_DST_IP(p);
 +            break;
 +        case SPOINK_BLOCK_BOTH:
++            ip = GET_DST_IP(p);
++            if (!s2c_parse_search_wl(data, ip))
++                s2c_pf_block(data, ip);
++            /* CONTINUE */
 +        case SPOINK_BLOCK_SRC:
 +        default:
 +            ip = GET_SRC_IP(p);
 +            break;
 +    }
-+
 +    if (s2c_parse_search_wl(data, ip))
 +        return;
 +    else
-+        s2c_pf_block_5tuple(data, p);
++        s2c_pf_block(data, ip);
 +
 +    return;
 +}
@@ -593,106 +599,73 @@ diff -ruN ./snort-2.9.20.orig/src/output-plugins/spo_pf.c ./snort-2.9.20/src/out
 +}
 +
 +static int
-+s2c_pf_block_5tuple(SpoAlertPfData *data, Packet *p) 
++s2c_pf_block(SpoAlertPfData *data, sfaddr_t *net_addr) 
 +{ 
-+    struct pfioc_rule pr;
-+    struct pfctl_kill kill;
++    struct pfr_table table;
++    struct pfr_addr addr;
++    int nadd = 0;
 +    int nerrors = 0;
-+    unsigned int nkill = 0;
 +
 +    if (data->fd < 0)
 +        data->fd = s2c_pf_init();
 +    if (data->fd == -1) {
-+        s2c_ErrorMessage("s2c_pf_init() => no pf device available!\n");
++        s2c_ErrorMessage("s2c_pf_init() => no pf device available! Unable to add IP to block list.\n");
 +        return -1;
 +    }
 +
-+    memset(&pr, 0, sizeof(pr));
-+    strlcpy(pr.anchor, data->pftable, sizeof(pr.anchor)); 
++    memset(&table, 0x00, sizeof(struct pfr_table)); 
++    memset(&addr,  0x00, sizeof(struct pfr_addr)); 
 +
-+    // Get the current ticket for the anchor to safely inject a rule
-+    if (ioctl(data->fd, DIOCGETRULES, &pr)) {
-+        s2c_ErrorMessage("s2c_pf_block_5tuple() => DIOCGETRULES failed to get anchor ticket: %s\n", strerror(errno));
-+        return -1;
-+    }
++    strlcpy(table.pfrt_name, data->pftable, PF_TABLE_NAME_SIZE); 
++    net_addr->family == AF_INET ? memcpy(&addr.pfra_ip4addr.s_addr, sfaddr_get_ip4_ptr(net_addr), sizeof(in_addr_t)) : memcpy(&addr.pfra_ip6addr, sfaddr_get_ip6_ptr(net_addr), sizeof(struct in6_addr));
++    addr.pfra_af  = net_addr->family; 
++    addr.pfra_net = net_addr->family == AF_INET ? 32 : 128; 
 +
-+    pr.rule.action = PF_DROP;
-+    pr.rule.quick = 1;
-+    pr.rule.keep_state = 0;
-+    pr.rule.af = p->family;
-+    pr.rule.proto = p->iph->ip_p; 
++    // Add offender's IP address to passed pf table
++    if (pfctl_table_add_addrs(data->fd, &table, &addr, 1, &nadd, 0))
++        s2c_ErrorMessage("s2c_pf_block() => pfctl_table_add_addrs(): failed to add IP to pf table\n");
 +
-+    pr.rule.src.addr.type = PF_ADDR_ADDRMASK;
-+    if (p->family == AF_INET) {
-+        memcpy(&pr.rule.src.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(GET_SRC_IP(p)), sizeof(in_addr_t));
-+    } else {
-+        memcpy(&pr.rule.src.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(GET_SRC_IP(p)), sizeof(struct in6_addr));
-+    }
-+    memset(&pr.rule.src.addr.v.a.mask, 0xff, sizeof(pr.rule.src.addr.v.a.mask));
++    // Attempt to kill any open firewall states associated with blocked IP
++    if (data->kill && nadd > 0) {
++        struct pfctl_kill kill = {
++            .af = net_addr->family,
++        };
++        unsigned int nkill = 0;
 +
-+    pr.rule.dst.addr.type = PF_ADDR_ADDRMASK;
-+    if (p->family == AF_INET) {
-+        memcpy(&pr.rule.dst.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(GET_DST_IP(p)), sizeof(in_addr_t));
-+    } else {
-+        memcpy(&pr.rule.dst.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(GET_DST_IP(p)), sizeof(struct in6_addr));
-+    }
-+    memset(&pr.rule.dst.addr.v.a.mask, 0xff, sizeof(pr.rule.dst.addr.v.a.mask));
++		memset(&kill.src.addr.v.a.mask, 0xff, sizeof(kill.src.addr.v.a.mask));
++		if (kill.af == AF_INET)
++			memcpy(&kill.src.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(net_addr), sizeof(in_addr_t));
++		else if (kill.af == AF_INET6)
++			memcpy(&kill.src.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(net_addr), sizeof(struct in6_addr));
++		else
++			return (-1);
 +
-+    if (p->tcph) {
-+        pr.rule.src.port_op = PF_OP_EQ;
-+        pr.rule.src.port[0] = p->tcph->th_sport;
-+        pr.rule.dst.port_op = PF_OP_EQ;
-+        pr.rule.dst.port[0] = p->tcph->th_dport;
-+    } else if (p->udph) {
-+        pr.rule.src.port_op = PF_OP_EQ;
-+        pr.rule.src.port[0] = p->udph->uh_sport;
-+        pr.rule.dst.port_op = PF_OP_EQ;
-+        pr.rule.dst.port[0] = p->udph->uh_dport;
-+    }
-+
-+    // Inject the rule
-+    if (ioctl(data->fd, DIOCADDRULE, &pr)) {
-+        s2c_ErrorMessage("s2c_pf_block_5tuple() => DIOCADDRULE failed to inject rule: %s\n", strerror(errno));
-+        nerrors++;
-+    }
-+
-+    // Immediately kill the specific state to simulate an inline drop
-+    if (data->kill) {
-+        memset(&kill, 0, sizeof(kill));
-+        kill.af = p->family;
-+        kill.proto = p->iph->ip_p;
-+
-+        memset(&kill.src.addr.v.a.mask, 0xff, sizeof(kill.src.addr.v.a.mask));
-+        if (kill.af == AF_INET)
-+            memcpy(&kill.src.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(GET_SRC_IP(p)), sizeof(in_addr_t));
-+        else
-+            memcpy(&kill.src.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(GET_SRC_IP(p)), sizeof(struct in6_addr));
-+
-+        memset(&kill.dst.addr.v.a.mask, 0xff, sizeof(kill.dst.addr.v.a.mask));
-+        if (kill.af == AF_INET)
-+            memcpy(&kill.dst.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(GET_DST_IP(p)), sizeof(in_addr_t));
-+        else
-+            memcpy(&kill.dst.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(GET_DST_IP(p)), sizeof(struct in6_addr));
-+
-+        if (p->tcph) {
-+            kill.src.port[0] = p->tcph->th_sport;
-+            kill.src.port_op = PF_OP_EQ;
-+            kill.dst.port[0] = p->tcph->th_dport;
-+            kill.dst.port_op = PF_OP_EQ;
-+        } else if (p->udph) {
-+            kill.src.port[0] = p->udph->uh_sport;
-+            kill.src.port_op = PF_OP_EQ;
-+            kill.dst.port[0] = p->udph->uh_dport;
-+            kill.dst.port_op = PF_OP_EQ;
-+        }
-+
-+        if (pfctl_kill_states(data->fd, &kill, &nkill)) {
-+            s2c_ErrorMessage("s2c_pf_block_5tuple() => pfctl_kill_states() failed on 5-tuple.\n");
++        // Kill any open firewall states where blocked IP is the SRC
++		if (pfctl_kill_states(data->fd, &kill, &nkill)) {
++            s2c_ErrorMessage("s2c_pf_block() => pfctl_kill_states(): failed to kill states where blocked IP address was SRC.\n");
 +            nerrors++;
 +        }
-+    }
 +
-+    return (nerrors) ? -1 : 0; 
++		memset(&kill, 0, sizeof(kill));
++		memset(&kill.dst.addr.v.a.mask, 0xff, sizeof(kill.dst.addr.v.a.mask));
++		kill.af = net_addr->family;
++
++		if (kill.af == AF_INET)
++			memcpy(&kill.dst.addr.v.a.addr.v4.s_addr, sfaddr_get_ip4_ptr(net_addr), sizeof(in_addr_t));
++		else if (kill.af == AF_INET6)
++			memcpy(&kill.dst.addr.v.a.addr.v6, sfaddr_get_ip6_ptr(net_addr), sizeof(struct in6_addr));
++
++        // Kill any open firewall states where blocked IP is the DST
++		if (pfctl_kill_states(data->fd, &kill, &nkill)) {
++            s2c_ErrorMessage("s2c_pf_block() => pfctl_kill_states(): failed to kill states where blocked IP address was DST.\n");
++            nerrors++;
++        }
++	}
++
++    if (nerrors)
++        return (-1);
++    else
++        return (0); 
 +}
 +
 +static int
